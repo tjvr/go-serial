@@ -10,6 +10,7 @@
 package serial
 
 import (
+	"context"
 	"io/ioutil"
 	"regexp"
 	"strings"
@@ -88,6 +89,86 @@ func (port *unixPort) Read(p []byte) (int, error) {
 		}
 		if res.IsReadable(port.closeSignal.ReadFD()) {
 			return 0, &PortError{code: PortClosed}
+		}
+		if !res.IsReadable(port.handle) {
+			// Timeout happened
+			return 0, nil
+		}
+		n, err := unix.Read(port.handle, p)
+		if err == unix.EINTR {
+			continue
+		}
+		// Linux: when the port is disconnected during a read operation
+		// the port is left in a "readable with zero-length-data" state.
+		// https://stackoverflow.com/a/34945814/1655275
+		if n == 0 && err == nil {
+			return 0, &PortError{code: PortClosed}
+		}
+		if n < 0 { // Do not return -1 unix errors
+			n = 0
+		}
+		return n, err
+	}
+}
+
+func (port *unixPort) ReadWithContext(ctx context.Context, p []byte) (int, error) {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return 0, &PortError{code: PortClosed}
+	}
+
+	var deadline time.Time
+	if port.readTimeout != NoTimeout {
+		deadline = time.Now().Add(port.readTimeout)
+	}
+
+	// This pipe is used as a signal to cancel blocking Read
+	cancelLock := sync.RWMutex{}
+	cancelLock.RLock()
+	defer cancelLock.RUnlock()
+
+	cancelSignal := &unixutils.Pipe{}
+	if err := cancelSignal.Open(); err != nil {
+		return 0, &PortError{code: InvalidSerialPort, causedBy: err}
+	}
+	go func() {
+		<-ctx.Done()
+		cancelSignal.Write([]byte{0})
+
+		// Wait for ReadWithContext to return.
+		cancelLock.Lock()
+		defer cancelLock.Unlock()
+
+		// Close signaling pipe.
+		//
+		// We have nowhere to return an error here, so we don't.
+		_ = cancelSignal.Close()
+	}()
+
+	fds := unixutils.NewFDSet(port.handle, port.closeSignal.ReadFD(), cancelSignal.ReadFD())
+	for {
+		timeout := time.Duration(-1)
+		if port.readTimeout != NoTimeout {
+			timeout = time.Until(deadline)
+			if timeout < 0 {
+				// a negative timeout means "no-timeout" in Select(...)
+				timeout = 0
+			}
+		}
+		res, err := unixutils.Select(fds, nil, fds, timeout)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if res.IsReadable(port.closeSignal.ReadFD()) {
+			return 0, &PortError{code: PortClosed}
+		}
+		if res.IsReadable(cancelSignal.ReadFD()) {
+			// Context cancelled
+			return 0, nil
 		}
 		if !res.IsReadable(port.handle) {
 			// Timeout happened

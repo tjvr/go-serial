@@ -6,7 +6,10 @@
 
 package serial
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 //go:generate go run golang.org/x/sys/windows/mkwinsyscall -output zsyscall_windows.go syscall_windows.go
 
@@ -21,6 +24,15 @@ type Port interface {
 	// The Read function blocks until (at least) one byte is received from
 	// the serial port or an error occurs.
 	Read(p []byte) (n int, err error)
+
+	// Like [Read], stores data received from the serial port into the provided
+	// byte array buffer. The function returns the number of bytes read.
+	//
+	// Additionally takes a Context so that the read can be cancelled.
+	//
+	// The Read function blocks until (at least) one byte is received from the
+	// serial port, the context is cancelled, or an error occurs.
+	ReadWithContext(ctx context.Context, p []byte) (n int, err error)
 
 	// Send the content of the data byte array to the serial port.
 	// Returns the number of bytes written.
